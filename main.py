@@ -149,15 +149,23 @@ class WingetUpgradeApp(ctk.CTk):
 
     def _on_refresh_complete(self, packages: List[Package], output: str):
         """Handle refresh completion."""
-        self.packages = packages
+        # Filter out pinned packages (they often can't be upgraded via winget)
+        pinned_packages = [p for p in packages if p.pinned]
+        regular_packages = [p for p in packages if not p.pinned]
+
+        self.packages = regular_packages
         self.is_refreshing = False
 
         self.refresh_button.configure(state="normal", text="🔄 Refresh")
 
-        if packages:
-            self.package_list.set_packages(packages)
-            self.count_label.configure(text=f"{len(packages)} updates available")
-            self.status_bar.set_status(f"Found {len(packages)} packages to upgrade")
+        if regular_packages:
+            self.package_list.set_packages(regular_packages)
+            self.count_label.configure(
+                text=f"{len(regular_packages)} updates available"
+            )
+            self.status_bar.set_status(
+                f"Found {len(regular_packages)} packages to upgrade"
+            )
             self.upgrade_all_button.configure(state="normal")
         else:
             self.package_list.show_empty_message("✓ All packages are up to date!")
@@ -166,6 +174,14 @@ class WingetUpgradeApp(ctk.CTk):
             self.upgrade_all_button.configure(state="disabled")
 
         self.output_console.append(output)
+
+        # Log info about excluded pinned packages
+        if pinned_packages:
+            pinned_names = ", ".join(p.name for p in pinned_packages)
+            self.output_console.append(
+                f"\n⚠️ Excluded {len(pinned_packages)} pinned package(s) that require manual upgrade: {pinned_names}"
+            )
+
         self.output_console.append("\n" + "=" * 50 + "\n")
 
     def upgrade_single(self, package: Package):
@@ -202,7 +218,7 @@ class WingetUpgradeApp(ctk.CTk):
 
             self.after(0, update_ui)
 
-        upgrade_package(package.id, on_output, on_complete)
+        upgrade_package(package.id, on_output, on_complete, pinned=package.pinned)
 
     def _handle_output_line(self, line: str, card):
         """Parse output line and update progress if applicable."""

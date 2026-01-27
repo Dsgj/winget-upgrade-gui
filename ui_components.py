@@ -38,10 +38,13 @@ class PackageCard(ctk.CTkFrame):
         info_frame.grid(row=0, column=0, sticky="nsew", padx=15, pady=12)
         info_frame.grid_columnconfigure(0, weight=1)
 
-        # Package name (truncate if too long)
+        # Package name (truncate if too long) with pinned indicator
         display_name = (
             package.name[:50] + "..." if len(package.name) > 50 else package.name
         )
+        # Add pinned indicator for packages requiring explicit targeting
+        if package.pinned:
+            display_name = f"📌 {display_name}"
         self.name_label = ctk.CTkLabel(
             info_frame,
             text=display_name,

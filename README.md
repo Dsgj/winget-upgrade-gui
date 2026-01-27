@@ -22,6 +22,7 @@ A modern, dark-themed desktop GUI for managing Windows package upgrades via wing
 - 📜 **Live Console** — View command output in the integrated console
 - 🌙 **Dark Mode** — Modern dark theme that's easy on the eyes
 - 🔄 **Auto-Refresh** — Automatically scan for updates on launch
+- 📌 **Smart Filtering** — Automatically excludes pinned packages that can't be upgraded via winget
 
 ---
 

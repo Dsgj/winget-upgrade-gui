@@ -19,6 +19,7 @@ class Package:
     current_version: str
     available_version: str
     source: str
+    pinned: bool = False  # True if package requires explicit targeting for upgrade
 
 
 def get_upgradable_packages() -> tuple[List[Package], str]:
@@ -52,74 +53,117 @@ def parse_winget_output(output: str) -> List[Package]:
     packages = []
     lines = output.strip().split("\n")
 
-    # Find the header line with dashes
-    header_index = -1
+    # Find sections - there may be two: regular upgrades and pinned packages
+    # Pinned packages section starts with "The following packages have an upgrade available, but require explicit targeting"
+    pinned_section_start = -1
     for i, line in enumerate(lines):
-        if line.startswith("---") or (line.startswith("-") and len(line) > 20):
-            header_index = i
+        if "require explicit targeting" in line.lower():
+            pinned_section_start = i
             break
 
-    if header_index == -1 or header_index == 0:
-        return packages
+    # Parse regular packages first, then pinned packages
+    sections_to_parse = []
 
-    # Get the header line to determine column positions
-    header_line = lines[header_index - 1]
-    dash_line = lines[header_index]
+    # Find all header lines (dash lines)
+    header_indices = []
+    for i, line in enumerate(lines):
+        if line.startswith("---") or (
+            line.startswith("-")
+            and len(line) > 20
+            and "require" not in lines[i - 1].lower()
+            if i > 0
+            else True
+        ):
+            header_indices.append(i)
 
-    # Find column positions based on the header
-    # Headers: Name, Id, Version, Available, Source
-    name_pos = 0
-    id_pos = header_line.lower().find("id")
-    version_pos = header_line.lower().find("version")
-    available_pos = header_line.lower().find("available")
-    source_pos = header_line.lower().find("source")
+    # Determine which section each header belongs to
+    for header_index in header_indices:
+        is_pinned = pinned_section_start != -1 and header_index > pinned_section_start
+        sections_to_parse.append((header_index, is_pinned))
 
-    # Fallback: use dash segments to find columns
-    if id_pos == -1:
-        # Try to find columns by looking at dash separations
-        segments = re.findall(r"-+", dash_line)
-        if len(segments) >= 5:
-            pos = 0
-            positions = []
-            for seg in segments:
-                positions.append(pos)
-                pos += len(seg) + 1
-            if len(positions) >= 5:
-                name_pos, id_pos, version_pos, available_pos, source_pos = positions[:5]
-
-    # Parse each package line
-    for line in lines[header_index + 1 :]:
-        if not line.strip():
-            continue
-        if "upgrades available" in line.lower():
-            continue
-        if line.startswith(" ") and len(line.strip()) == 0:
+    for header_index, is_pinned in sections_to_parse:
+        if header_index == 0:
             continue
 
-        try:
-            # Extract fields based on positions
-            if source_pos > 0:
-                name = line[name_pos:id_pos].strip()
-                pkg_id = line[id_pos:version_pos].strip()
-                current_ver = line[version_pos:available_pos].strip()
-                available_ver = line[available_pos:source_pos].strip()
-                source = line[source_pos:].strip()
+        # Get the header line to determine column positions
+        header_line = lines[header_index - 1]
+        dash_line = lines[header_index]
 
-                # Handle the < prefix in version (indicates older than)
-                current_ver = current_ver.lstrip("< ")
+        # Find column positions based on the header
+        # Headers: Name, Id, Version, Available, Source
+        name_pos = 0
+        id_pos = header_line.lower().find("id")
+        version_pos = header_line.lower().find("version")
+        available_pos = header_line.lower().find("available")
+        source_pos = header_line.lower().find("source")
 
-                if pkg_id and available_ver:
-                    packages.append(
-                        Package(
-                            name=name if name else pkg_id,
-                            id=pkg_id,
-                            current_version=current_ver,
-                            available_version=available_ver,
-                            source=source,
-                        )
+        # Fallback: use dash segments to find columns
+        if id_pos == -1:
+            # Try to find columns by looking at dash separations
+            segments = re.findall(r"-+", dash_line)
+            if len(segments) >= 5:
+                pos = 0
+                positions = []
+                for seg in segments:
+                    positions.append(pos)
+                    pos += len(seg) + 1
+                if len(positions) >= 5:
+                    name_pos, id_pos, version_pos, available_pos, source_pos = (
+                        positions[:5]
                     )
-        except Exception:
-            continue
+
+        # Find the end of this section (next header or end of output)
+        next_header = len(lines)
+        for other_header, _ in sections_to_parse:
+            if other_header > header_index:
+                # The section ends a few lines before the next header
+                next_header = other_header - 2
+                break
+
+        # Also check for the pinned section marker
+        if (
+            not is_pinned
+            and pinned_section_start != -1
+            and pinned_section_start < next_header
+        ):
+            next_header = pinned_section_start
+
+        # Parse each package line
+        for line in lines[header_index + 1 : next_header]:
+            if not line.strip():
+                continue
+            if "upgrades available" in line.lower():
+                continue
+            if "require explicit targeting" in line.lower():
+                continue
+            if line.startswith(" ") and len(line.strip()) == 0:
+                continue
+
+            try:
+                # Extract fields based on positions
+                if source_pos > 0:
+                    name = line[name_pos:id_pos].strip()
+                    pkg_id = line[id_pos:version_pos].strip()
+                    current_ver = line[version_pos:available_pos].strip()
+                    available_ver = line[available_pos:source_pos].strip()
+                    source = line[source_pos:].strip()
+
+                    # Handle the < prefix in version (indicates older than)
+                    current_ver = current_ver.lstrip("< ")
+
+                    if pkg_id and available_ver:
+                        packages.append(
+                            Package(
+                                name=name if name else pkg_id,
+                                id=pkg_id,
+                                current_version=current_ver,
+                                available_version=available_ver,
+                                source=source,
+                                pinned=is_pinned,
+                            )
+                        )
+            except Exception:
+                continue
 
     return packages
 
@@ -128,6 +172,7 @@ def upgrade_package(
     package_id: str,
     output_callback: Optional[Callable[[str], None]] = None,
     complete_callback: Optional[Callable[[bool, str], None]] = None,
+    pinned: bool = False,
 ) -> None:
     """
     Upgrade a specific package by ID.
@@ -137,18 +182,24 @@ def upgrade_package(
         package_id: The winget package ID to upgrade
         output_callback: Called with each line of output
         complete_callback: Called when complete with (success, message)
+        pinned: If True, use --include-pinned flag for packages requiring explicit targeting
     """
 
     def run_upgrade():
         try:
+            cmd = [
+                "winget",
+                "upgrade",
+                package_id,
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+            ]
+            # Add --include-pinned for pinned packages
+            if pinned:
+                cmd.append("--include-pinned")
+
             process = subprocess.Popen(
-                [
-                    "winget",
-                    "upgrade",
-                    package_id,
-                    "--accept-package-agreements",
-                    "--accept-source-agreements",
-                ],
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -213,14 +264,19 @@ def upgrade_all_packages(
                 output_callback(f"{'=' * 60}\n")
 
             try:
+                cmd = [
+                    "winget",
+                    "upgrade",
+                    pkg.id,
+                    "--accept-package-agreements",
+                    "--accept-source-agreements",
+                ]
+                # Add --include-pinned for pinned packages
+                if pkg.pinned:
+                    cmd.append("--include-pinned")
+
                 process = subprocess.Popen(
-                    [
-                        "winget",
-                        "upgrade",
-                        pkg.id,
-                        "--accept-package-agreements",
-                        "--accept-source-agreements",
-                    ],
+                    cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
