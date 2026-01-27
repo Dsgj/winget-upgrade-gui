@@ -7,13 +7,16 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   build:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -32,10 +35,56 @@ jobs:
             --collect-all customtkinter `
             --hidden-import customtkinter `
             --hidden-import darkdetect `
+            --hidden-import PIL `
             main.py
+
+      - name: Generate checksums
+        shell: pwsh
+        run: |
+          $exe = "dist/WingetUpgradeManager.exe"
+          $hash = (Get-FileHash -Path $exe -Algorithm SHA256).Hash
+          $size = (Get-Item $exe).Length / 1MB
+
+          # Create checksum file
+          "$hash  WingetUpgradeManager.exe" | Out-File -FilePath "dist/SHA256SUMS.txt" -Encoding utf8
+
+          # Output for logs
+          Write-Host "SHA256: $hash"
+          Write-Host "Size: $([math]::Round($size, 2)) MB"
+
+          # Set output for release notes
+          echo "sha256=$hash" >> $env:GITHUB_OUTPUT
+          echo "size=$([math]::Round($size, 2))" >> $env:GITHUB_OUTPUT
+        id: checksum
+
+      - name: Attest executable
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/WingetUpgradeManager.exe
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/WingetUpgradeManager.exe
+          files: |
+            dist/WingetUpgradeManager.exe
+            dist/SHA256SUMS.txt
           generate_release_notes: true
+          body: |
+            ## 📦 Download
+
+            Download `WingetUpgradeManager.exe` below.
+
+            ### Verification
+
+            **SHA256:** `${{ steps.checksum.outputs.sha256 }}`
+            **Size:** ${{ steps.checksum.outputs.size }} MB
+
+            To verify the checksum:
+            ```powershell
+            (Get-FileHash WingetUpgradeManager.exe).Hash -eq "${{ steps.checksum.outputs.sha256 }}"
+            ```
+
+            This release includes build provenance attestation. Verify with:
+            ```bash
+            gh attestation verify WingetUpgradeManager.exe --owner ${{ github.repository_owner }}
+            ```
