@@ -1,0 +1,2 @@
+# Development and build dependencies
+pyinstaller>=6.0
