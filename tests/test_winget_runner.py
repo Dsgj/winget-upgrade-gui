@@ -216,6 +216,8 @@ def test_reboot_required_is_success_with_flag():
         (0x8A150019, "Administrator"),
         (0x8A150068, "pin"),
         (0x8A15010A, "restart your PC"),
+        (0x8A150006, "installer ran but failed"),
+        (0x8A150008, "Downloading"),
     ],
 )
 def test_known_failure_codes_have_reasons(code, fragment):

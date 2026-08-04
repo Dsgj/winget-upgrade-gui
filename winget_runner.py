@@ -26,6 +26,9 @@ SCAN_TIMEOUT_SECONDS = 180
 # Documented winget return codes -> human-readable reason.
 # https://github.com/microsoft/winget-cli/blob/master/doc/windows/package-manager/winget/returnCodes.md
 FAILURE_RETURN_CODES = {
+    0x8A150001: "winget internal error",
+    0x8A150006: "The installer ran but failed",
+    0x8A150008: "Downloading the installer failed — check your network",
     0x8A150011: "Installer hash mismatch — the download does not match the manifest",
     0x8A150014: "No package found matching the given ID",
     0x8A150016: "Multiple packages matched — the package ID is ambiguous",
@@ -49,6 +52,10 @@ FAILURE_RETURN_CODES = {
     0x8A15010E: "A newer version is already installed",
     0x8A15010F: "Blocked by your organization's policy",
 }
+
+# Mapped failures whose text is generic — the installer's own output
+# (its exit code, log path) is the actionable part, so keep appending it.
+GENERIC_FAILURE_CODES = {0x8A150001, 0x8A150006}
 
 # Codes that mean "nothing to do" rather than a real failure.
 BENIGN_RETURN_CODES = {
@@ -359,7 +366,8 @@ def execute_upgrade(
     process.wait()
 
     success, reason, reboot = interpret_return_code(process.returncode)
-    if not success and (process.returncode & 0xFFFFFFFF) not in FAILURE_RETURN_CODES:
+    code = process.returncode & 0xFFFFFFFF
+    if not success and (code not in FAILURE_RETURN_CODES or code in GENERIC_FAILURE_CODES):
         hint = failure_hint(lines)
         if hint:
             reason = f"{reason} — {hint}"
