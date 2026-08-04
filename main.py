@@ -17,7 +17,15 @@ from tkinter import messagebox
 import customtkinter as ctk
 
 import config
-from ui_components import SUCCESS_COLORS, SUCCESS_HOVER, OutputConsole, PackageListFrame, StatusBar
+import process_guard
+from ui_components import (
+    SUCCESS_COLORS,
+    SUCCESS_HOVER,
+    ConfirmDialog,
+    OutputConsole,
+    PackageListFrame,
+    StatusBar,
+)
 from version import __version__
 from winget_runner import (
     Package,
@@ -30,6 +38,9 @@ from winget_runner import (
 logger = logging.getLogger(__name__)
 
 APPEARANCE_OPTIONS = ["System", "Light", "Dark"]
+
+# How long an unanswered "close the running app?" prompt blocks a batch.
+PROMPT_TIMEOUT_SECONDS = 300
 
 # Accepts decimal commas — winget localizes numbers (e.g. "4,5 MB" on Swedish).
 _PROGRESS_RE = re.compile(r"([\d.,]+)\s*(KB|MB|GB)\s*/\s*([\d.,]+)\s*(KB|MB|GB)")
@@ -363,10 +374,17 @@ class WingetUpgradeApp(ctk.CTk):
 
         def on_complete(success_count: int, fail_count: int, cancelled: bool):
             def update_ui():
+                # A package cancelled during its preflight never reports a
+                # result, so clear its half-started card state here.
+                card = self.current_upgrade_card
+                if card is not None and card.is_upgrading:
+                    card.set_upgrading(False)
+                self.current_upgrade_card = None
                 self.cancel_button.grid_remove()
                 self.cancel_button.configure(state="normal", text="✕ Cancel")
                 self.progress_bar.grid_remove()
                 self.status_bar.set_progress("")
+                self._download_active = False
                 self._clear_busy()
 
                 parts = [f"{success_count} succeeded"]
@@ -393,7 +411,94 @@ class WingetUpgradeApp(ctk.CTk):
             package_complete_callback=on_package_complete,
             complete_callback=on_complete,
             cancel_event=self.cancel_event,
+            preflight_callback=self._preflight_close_running,
         )
+
+    def _log_async(self, message: str):
+        """Append to the console from a worker thread."""
+        self.after(0, lambda: self.output_console.append(message))
+
+    def _preflight_close_running(self, package: Package):
+        """Runs on the worker thread before each upgrade: if the app has
+        running processes, ask the user (on the UI thread) whether to close
+        them so the installer can replace its files.
+
+        Never raises — a failed check just means we upgrade as before.
+        """
+        if self.cancel_event.is_set():
+            return
+        try:
+            install_dirs = process_guard.find_install_dirs(package.name)
+            processes = process_guard.find_running_processes(install_dirs)
+        except Exception:
+            logger.exception("Process check failed for %s", package.id)
+            return
+        if not processes or self.cancel_event.is_set():
+            return
+
+        names = sorted({p.name for p in processes})
+        self._log_async(f"⚠️ {package.name} is running: {', '.join(names)}")
+
+        answered = threading.Event()
+        answer = {"close": False}
+        dialog_ref: dict[str, object] = {}
+
+        def ask():
+            def on_answer(value: bool):
+                answer["close"] = value
+                answered.set()
+
+            try:
+                dialog_ref["dialog"] = ConfirmDialog(
+                    self,
+                    "Application is running",
+                    f"{package.name} appears to be running:\n\n"
+                    + "\n".join(f"    •  {name}" for name in names)
+                    + "\n\nClose it so the upgrade can proceed?\n"
+                    "Choosing No upgrades anyway, which may fail on locked files.",
+                    on_answer,
+                )
+            except Exception:
+                logger.exception("Could not show the close-app prompt")
+                answered.set()
+
+        self.after(0, ask)
+
+        # Wait in slices so a Cancel click doesn't leave the batch parked on
+        # an unanswered prompt; never wedge the worker indefinitely either.
+        deadline = time.monotonic() + PROMPT_TIMEOUT_SECONDS
+        while not answered.wait(timeout=0.25):
+            if self.cancel_event.is_set() or time.monotonic() > deadline:
+                break
+
+        if not answered.is_set():
+            def dismiss():
+                dialog = dialog_ref.get("dialog")
+                if dialog is not None:
+                    dialog.dismiss()
+
+            self.after(0, dismiss)
+            self._log_async(
+                "Prompt dismissed — "
+                + ("upgrade cancelled." if self.cancel_event.is_set() else "upgrading anyway.")
+            )
+            return
+
+        if not answer["close"] or self.cancel_event.is_set():
+            return
+
+        self._log_async(f"Closing {', '.join(names)}…")
+        try:
+            remaining = process_guard.close_processes(processes)
+        except Exception:
+            logger.exception("Closing processes failed for %s", package.id)
+            return
+
+        if remaining:
+            still = ", ".join(sorted({p.name for p in remaining}))
+            self._log_async(f"⚠️ Could not close: {still} — the upgrade may fail.")
+        else:
+            self._log_async(f"Closed {', '.join(names)}.")
 
     def _on_cancel(self):
         self.cancel_event.set()

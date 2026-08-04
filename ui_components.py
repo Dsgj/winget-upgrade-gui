@@ -20,6 +20,99 @@ DANGER_TEXT = ("#C0392B", "#E74C3C")
 MUTED_TEXT = ("gray40", "gray60")
 
 
+class ConfirmDialog(ctk.CTkToplevel):
+    """Modal yes/no dialog that the caller can also dismiss programmatically.
+
+    tkinter's messagebox maps to a native MessageBoxW that cannot be closed
+    from code, so a timed-out prompt would linger and keep the main window
+    disabled. This one exposes dismiss().
+    """
+
+    def __init__(self, parent, title: str, message: str, on_answer: Callable[[bool], None]):
+        super().__init__(parent)
+        self._on_answer = on_answer
+        self._answered = False
+
+        self.title(title)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", lambda: self._answer(False))
+
+        container = ctk.CTkFrame(self, fg_color="transparent")
+        container.pack(padx=24, pady=20, fill="both", expand=True)
+
+        ctk.CTkLabel(
+            container,
+            text=message,
+            font=ctk.CTkFont(size=13),
+            justify="left",
+            anchor="w",
+            wraplength=460,
+        ).pack(anchor="w", pady=(0, 18))
+
+        buttons = ctk.CTkFrame(container, fg_color="transparent")
+        buttons.pack(anchor="e")
+
+        no_button = ctk.CTkButton(
+            buttons,
+            text="No",
+            width=110,
+            height=34,
+            fg_color="transparent",
+            border_width=1,
+            text_color=("gray20", "gray80"),
+            hover_color=("gray85", "gray25"),
+            command=lambda: self._answer(False),
+        )
+        no_button.pack(side="left", padx=(0, 10))
+
+        yes_button = ctk.CTkButton(
+            buttons,
+            text="Yes, close it",
+            width=140,
+            height=34,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color=SUCCESS_COLORS,
+            hover_color=SUCCESS_HOVER,
+            command=lambda: self._answer(True),
+        )
+        yes_button.pack(side="left")
+
+        self.bind("<Escape>", lambda _event: self._answer(False))
+        self.bind("<Return>", lambda _event: self._answer(True))
+
+        self.update_idletasks()
+        self._center_on(parent)
+        self.grab_set()
+        yes_button.focus_set()
+
+    def _center_on(self, parent) -> None:
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    def _answer(self, value: bool) -> None:
+        if self._answered:
+            return
+        self._answered = True
+        self._close()
+        self._on_answer(value)
+
+    def _close(self) -> None:
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        if self.winfo_exists():
+            self.destroy()
+
+    def dismiss(self) -> None:
+        """Close the dialog without answering (timeout/cancel paths)."""
+        if not self._answered:
+            self._answered = True
+            self._close()
+
+
 class PackageCard(ctk.CTkFrame):
     """A card for one package: checkbox, info, upgrade button, progress/result row."""
 

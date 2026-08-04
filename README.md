@@ -23,6 +23,7 @@ A modern desktop GUI for managing Windows package upgrades via winget — with d
 - ☑️ **Pick What You Upgrade** — Per-package checkboxes with *Upgrade Selected*, or upgrade one package with a click
 - 🧠 **Remembered Skips** — Packages you deselect stay deselected on future scans
 - 💬 **Clear Failure Reasons** — When an upgrade fails you see *why* (app running, needs admin, disk full, pinned, …) mapped from winget's documented return codes, right on the package card
+- 🔒 **App-In-Use Detection** — If the app you're upgrading is running, you get a yes/no prompt to close it first (graceful close, force only if needed) so the installer doesn't fail on locked files
 - 📊 **Real-Time Progress** — Download and installation progress per package and overall
 - 🛑 **Safe Cancel** — Stop a batch upgrade; the package in flight finishes cleanly first
 - 📜 **Live Console** — Full winget output in the integrated console
@@ -99,6 +100,7 @@ winget-upgrade-gui/
 ├── main.py              # Application window and orchestration
 ├── ui_components.py     # Custom UI components
 ├── winget_runner.py     # winget execution, parsing, return-code mapping
+├── process_guard.py     # Detects/closes running apps before upgrading
 ├── config.py            # Persisted settings + logging
 ├── version.py           # Single source of truth for the version
 ├── build.py             # Build script (used locally and by CI)

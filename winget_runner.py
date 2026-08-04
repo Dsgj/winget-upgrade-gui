@@ -388,6 +388,7 @@ def upgrade_packages(
     package_complete_callback: Callable[[Package, UpgradeResult], None] | None = None,
     complete_callback: Callable[[int, int, bool], None] | None = None,
     cancel_event: threading.Event | None = None,
+    preflight_callback: Callable[[Package], None] | None = None,
 ) -> threading.Thread:
     """Upgrade packages sequentially on a worker thread.
 
@@ -401,35 +402,58 @@ def upgrade_packages(
         progress_callback: Called with (index_1based, total, package) as each starts.
         package_complete_callback: Called with (package, UpgradeResult) as each finishes.
         complete_callback: Called at the end with (success_count, fail_count, cancelled).
+        preflight_callback: Called with the package just before its upgrade
+            starts; may block (e.g. to close the running app first).
     """
+
+    def cancelled_now() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
 
     def run_all() -> None:
         success_count = 0
         fail_count = 0
         cancelled = False
 
-        for i, pkg in enumerate(packages):
-            if cancel_event is not None and cancel_event.is_set():
-                cancelled = True
-                break
+        try:
+            for i, pkg in enumerate(packages):
+                if cancelled_now():
+                    cancelled = True
+                    break
 
-            if progress_callback:
-                progress_callback(i + 1, len(packages), pkg)
-            if output_callback:
-                output_callback("=" * 60)
-                output_callback(f"Upgrading {pkg.name} ({i + 1}/{len(packages)})")
-                output_callback("=" * 60)
+                if progress_callback:
+                    progress_callback(i + 1, len(packages), pkg)
+                if output_callback:
+                    output_callback("=" * 60)
+                    output_callback(f"Upgrading {pkg.name} ({i + 1}/{len(packages)})")
+                    output_callback("=" * 60)
 
-            result = execute_upgrade(pkg, output_callback)
-            if result.success:
-                success_count += 1
-            else:
-                fail_count += 1
-            if package_complete_callback:
-                package_complete_callback(pkg, result)
+                if preflight_callback:
+                    # Must never take the worker down: a failed preflight
+                    # only means we upgrade without closing anything.
+                    try:
+                        preflight_callback(pkg)
+                    except Exception:
+                        logger.exception("Preflight failed for %s", pkg.id)
+                # The preflight can block for a long time (user prompt), so
+                # honour a cancel that arrived while it ran — no installer
+                # has started yet, so stopping here is safe.
+                if cancelled_now():
+                    cancelled = True
+                    break
 
-        if complete_callback:
-            complete_callback(success_count, fail_count, cancelled)
+                result = execute_upgrade(pkg, output_callback)
+                if result.success:
+                    success_count += 1
+                else:
+                    fail_count += 1
+                if package_complete_callback:
+                    package_complete_callback(pkg, result)
+        except Exception:
+            logger.exception("Upgrade batch failed")
+        finally:
+            # Always report, or the UI stays stuck in its busy state.
+            if complete_callback:
+                complete_callback(success_count, fail_count, cancelled)
 
     thread = threading.Thread(target=run_all, daemon=True, name="winget-upgrade")
     thread.start()

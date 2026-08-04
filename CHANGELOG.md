@@ -3,11 +3,42 @@
 All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [1.3.0] - 2026-08-04
+
+### Added
+
+- **App-in-use detection**: before each upgrade, the app's running
+  processes (resolved via the uninstall registry and a process scan)
+  trigger a yes/no prompt to close them — a graceful window close first,
+  force-kill only for what survives. Declining upgrades anyway.
+- Custom modal confirmation dialog that the app can also dismiss itself,
+  so an unanswered prompt can never leave the window disabled.
+
+### Safety rules for closing processes
+
+- Never closes this app or any of its ancestors, so upgrading the
+  terminal or launcher that started it cannot kill it mid-batch.
+- Rejects shared install roots (Windows, Program Files itself, Common
+  Files, the user profile, AppData) that would otherwise match unrelated
+  or system processes.
+- Requires a package name to match a registry entry exactly or with only
+  a version/qualifier suffix, so "Microsoft Edge" never matches
+  "Microsoft Edge WebView2 Runtime".
+- Re-checks that a PID still runs the executable that was detected before
+  killing it, so a recycled PID is never hit; force-kill does not cascade
+  to child processes that may belong to other applications.
+
+### Fixed
 
 - Map winget codes 0x8A150001/0x8A150006/0x8A150008 to readable reasons;
   generic installer failures keep the installer's exit code and log path
   in the message.
+- A failing preflight or upgrade batch can no longer kill the worker
+  thread and leave the UI stuck in its busy state.
+- Cancel is honoured after the preflight, so a cancelled batch no longer
+  starts one more install.
+- The package banner now prints before preflight output, keeping console
+  lines in the right section.
 
 ## [1.2.0] - 2026-08-04
 
