@@ -3,17 +3,54 @@ Winget Upgrade GUI
 A modern desktop application for managing Windows package upgrades via winget.
 """
 
-import customtkinter as ctk
-import threading
-from typing import List
+from __future__ import annotations
 
+import ctypes
+import logging
+import re
+import sys
+import threading
+import time
+from pathlib import Path
+from tkinter import messagebox
+
+import customtkinter as ctk
+
+import config
+from ui_components import SUCCESS_COLORS, SUCCESS_HOVER, OutputConsole, PackageListFrame, StatusBar
+from version import __version__
 from winget_runner import (
     Package,
+    ScanResult,
+    UpgradeResult,
     get_upgradable_packages,
-    upgrade_package,
-    upgrade_all_packages,
+    upgrade_packages,
 )
-from ui_components import PackageListFrame, OutputConsole, StatusBar
+
+logger = logging.getLogger(__name__)
+
+APPEARANCE_OPTIONS = ["System", "Light", "Dark"]
+
+# Accepts decimal commas — winget localizes numbers (e.g. "4,5 MB" on Swedish).
+_PROGRESS_RE = re.compile(r"([\d.,]+)\s*(KB|MB|GB)\s*/\s*([\d.,]+)\s*(KB|MB|GB)")
+_UNIT_KB = {"KB": 1, "MB": 1024, "GB": 1024 * 1024}
+
+
+def _to_float(number: str) -> float:
+    return float(number.replace(",", "."))
+
+
+def resource_path(name: str) -> Path:
+    """Path to a bundled resource, both from source and PyInstaller-frozen."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    return base / name
+
+
+def is_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except (AttributeError, OSError):
+        return False
 
 
 class WingetUpgradeApp(ctk.CTk):
@@ -22,39 +59,45 @@ class WingetUpgradeApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        # Window configuration
-        self.title("Winget Upgrade Manager")
-        self.geometry("950x750")
-        self.minsize(700, 500)
+        self.config_data = config.load_config()
 
-        # Set appearance
-        ctk.set_appearance_mode("dark")
+        self.title(f"Winget Upgrade Manager  v{__version__}")
+        self.geometry("980x760")
+        self.minsize(720, 520)
+        try:
+            self.iconbitmap(str(resource_path("assets/icon.ico")))
+        except Exception:
+            pass  # icon is cosmetic; never block startup on it
+
+        appearance = str(self.config_data.get("appearance", "dark")).capitalize()
+        if appearance not in APPEARANCE_OPTIONS:
+            appearance = "Dark"
+        ctk.set_appearance_mode(appearance.lower())
         ctk.set_default_color_theme("blue")
 
-        # State
-        self.packages: List[Package] = []
-        self.is_refreshing = False
-        self.is_upgrading_all = False
+        # State. busy is None or one of "refresh" / "upgrade".
+        self.packages: list[Package] = []
+        self.busy: str | None = None
+        self.cancel_event = threading.Event()
+        self.current_upgrade_card = None
+        self._download_active = False
 
-        # Build UI
-        self._create_ui()
+        self._create_ui(appearance)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Initial refresh
-        self.after(500, self.refresh_packages)
+        self.after(300, self.refresh_packages)
 
-    def _create_ui(self):
-        """Create the main UI layout."""
-        # Configure grid
+    # ------------------------------------------------------------------ UI
+
+    def _create_ui(self, appearance: str):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(2, weight=1)
-        self.grid_rowconfigure(3, weight=0)
 
-        # ========== Header Section ==========
+        # ========== Header ==========
         header_frame = ctk.CTkFrame(self, fg_color="transparent")
         header_frame.grid(row=0, column=0, sticky="ew", padx=20, pady=(20, 10))
         header_frame.grid_columnconfigure(1, weight=1)
 
-        # Title
         title_label = ctk.CTkLabel(
             header_frame,
             text="📦 Winget Upgrade Manager",
@@ -62,7 +105,6 @@ class WingetUpgradeApp(ctk.CTk):
         )
         title_label.grid(row=0, column=0, sticky="w")
 
-        # Package count
         self.count_label = ctk.CTkLabel(
             header_frame,
             text="",
@@ -71,275 +113,380 @@ class WingetUpgradeApp(ctk.CTk):
         )
         self.count_label.grid(row=0, column=1, sticky="w", padx=(15, 0))
 
-        # Refresh button
+        self.appearance_control = ctk.CTkSegmentedButton(
+            header_frame,
+            values=APPEARANCE_OPTIONS,
+            width=180,
+            height=28,
+            font=ctk.CTkFont(size=11),
+            command=self._on_appearance_change,
+        )
+        self.appearance_control.set(appearance)
+        self.appearance_control.grid(row=0, column=2, sticky="e", padx=(0, 12))
+
         self.refresh_button = ctk.CTkButton(
             header_frame, text="🔄 Refresh", width=100, command=self.refresh_packages
         )
-        self.refresh_button.grid(row=0, column=2, sticky="e")
+        self.refresh_button.grid(row=0, column=3, sticky="e")
 
         # ========== Action Bar ==========
         action_frame = ctk.CTkFrame(self, fg_color="transparent")
         action_frame.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 10))
-        action_frame.grid_columnconfigure(0, weight=1)
+        action_frame.grid_columnconfigure(2, weight=1)
 
-        # Upgrade All button
-        self.upgrade_all_button = ctk.CTkButton(
+        self.select_all_var = ctk.BooleanVar(value=True)
+        self.select_all_checkbox = ctk.CTkCheckBox(
             action_frame,
-            text="⬆️ Upgrade All",
-            width=140,
+            text="Select all",
+            font=ctk.CTkFont(size=12),
+            variable=self.select_all_var,
+            command=self._on_select_all,
+        )
+        self.select_all_checkbox.grid(row=0, column=0, sticky="w", padx=(4, 16))
+
+        self.upgrade_button = ctk.CTkButton(
+            action_frame,
+            text="⬆️ Upgrade Selected",
+            width=180,
             height=38,
             font=ctk.CTkFont(size=14, weight="bold"),
-            fg_color=("#2ECC71", "#27AE60"),
-            hover_color=("#27AE60", "#1E8449"),
-            command=self.upgrade_all,
+            fg_color=SUCCESS_COLORS,
+            hover_color=SUCCESS_HOVER,
+            command=self.upgrade_selected,
         )
-        self.upgrade_all_button.grid(row=0, column=0, sticky="w")
+        self.upgrade_button.grid(row=0, column=1, sticky="w")
 
-        # Progress bar (hidden by default)
+        self.cancel_button = ctk.CTkButton(
+            action_frame,
+            text="✕ Cancel",
+            width=90,
+            height=38,
+            fg_color="transparent",
+            border_width=1,
+            border_color=("#C0392B", "#E74C3C"),
+            text_color=("#C0392B", "#E74C3C"),
+            hover_color=("gray85", "gray25"),
+            command=self._on_cancel,
+        )
+        self.cancel_button.grid(row=0, column=2, sticky="w", padx=(12, 0))
+        self.cancel_button.grid_remove()
+
         self.progress_bar = ctk.CTkProgressBar(action_frame, width=200)
-        self.progress_bar.grid(row=0, column=1, sticky="e", padx=(20, 0))
+        self.progress_bar.grid(row=0, column=3, sticky="e", padx=(20, 0))
         self.progress_bar.set(0)
         self.progress_bar.grid_remove()
 
-        # ========== Main Content Area ==========
-        # Create a paned window for resizable split
+        # ========== Main Content ==========
         content_frame = ctk.CTkFrame(self, fg_color="transparent")
         content_frame.grid(row=2, column=0, sticky="nsew", padx=20, pady=(0, 10))
         content_frame.grid_columnconfigure(0, weight=1)
         content_frame.grid_rowconfigure(0, weight=3)
         content_frame.grid_rowconfigure(1, weight=1)
 
-        # Package list
         list_container = ctk.CTkFrame(content_frame, corner_radius=10)
         list_container.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
         list_container.grid_columnconfigure(0, weight=1)
         list_container.grid_rowconfigure(0, weight=1)
 
         self.package_list = PackageListFrame(
-            list_container, on_upgrade=self.upgrade_single, corner_radius=10
+            list_container,
+            on_upgrade=self.upgrade_single,
+            on_toggle=self._on_package_toggle,
+            corner_radius=10,
         )
         self.package_list.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
 
-        # Output console
         self.output_console = OutputConsole(content_frame, height=180)
         self.output_console.grid(row=1, column=0, sticky="nsew")
 
         # ========== Status Bar ==========
         self.status_bar = StatusBar(self)
         self.status_bar.grid(row=3, column=0, sticky="ew")
+        if is_admin():
+            self.status_bar.set_meta("🛡️ Administrator")
+
+    # ------------------------------------------------------- busy handling
+
+    def _set_busy(self, mode: str):
+        self.busy = mode
+        self.refresh_button.configure(state="disabled")
+        self.upgrade_button.configure(state="disabled")
+        self.select_all_checkbox.configure(state="disabled")
+        self.package_list.set_all_enabled(False)
+
+    def _clear_busy(self):
+        self.busy = None
+        self.refresh_button.configure(state="normal", text="🔄 Refresh")
+        self.select_all_checkbox.configure(state="normal")
+        self.package_list.set_all_enabled(True)
+        self._update_selection_ui()
+
+    def _update_selection_ui(self):
+        """Sync the Upgrade Selected button and count label with reality."""
+        selected = len(self.package_list.selected_packages())
+        total = len(self.packages)
+        if total == 0:
+            self.upgrade_button.configure(
+                text="⬆️ Upgrade Selected", state="disabled", fg_color=SUCCESS_COLORS
+            )
+            self.count_label.configure(text="All up to date")
+        else:
+            self.upgrade_button.configure(
+                text=f"⬆️ Upgrade Selected ({selected})",
+                state="normal" if selected and self.busy is None else "disabled",
+                fg_color=SUCCESS_COLORS,
+            )
+            self.count_label.configure(
+                text=f"{total} update{'s' if total != 1 else ''} available"
+            )
+
+    # ------------------------------------------------------------- refresh
 
     def refresh_packages(self):
-        """Refresh the list of upgradable packages."""
-        if self.is_refreshing:
+        if self.busy is not None:
             return
 
-        self.is_refreshing = True
-        self.refresh_button.configure(state="disabled", text="Refreshing...")
-        self.status_bar.set_status("Scanning for updates...")
-        self.output_console.append("Running winget upgrade...")
+        self._set_busy("refresh")
+        self.refresh_button.configure(text="Refreshing…")
+        self.status_bar.set_status("Scanning for updates…")
+        self.package_list.show_message("🔍 Scanning for updates…\nThis can take a minute.")
+        self.output_console.append("Running: winget upgrade")
 
         def do_refresh():
-            packages, output = get_upgradable_packages()
+            result = get_upgradable_packages()
+            self.after(0, lambda: self._on_refresh_complete(result))
 
-            # Update UI on main thread
-            self.after(0, lambda: self._on_refresh_complete(packages, output))
+        threading.Thread(target=do_refresh, daemon=True, name="winget-scan").start()
 
-        thread = threading.Thread(target=do_refresh, daemon=True)
-        thread.start()
+    def _on_refresh_complete(self, result: ScanResult):
+        self._clear_busy()
+        self.output_console.append(result.raw_output)
+        self.status_bar.set_progress(f"🕒 Checked {time.strftime('%H:%M')}")
 
-    def _on_refresh_complete(self, packages: List[Package], output: str):
-        """Handle refresh completion."""
-        # Filter out pinned packages (they often can't be upgraded via winget)
-        pinned_packages = [p for p in packages if p.pinned]
-        regular_packages = [p for p in packages if not p.pinned]
-
-        self.packages = regular_packages
-        self.is_refreshing = False
-
-        self.refresh_button.configure(state="normal", text="🔄 Refresh")
-
-        if regular_packages:
-            self.package_list.set_packages(regular_packages)
-            self.count_label.configure(
-                text=f"{len(regular_packages)} updates available"
-            )
-            self.status_bar.set_status(
-                f"Found {len(regular_packages)} packages to upgrade"
-            )
-            self.upgrade_all_button.configure(state="normal")
-        else:
-            self.package_list.show_empty_message("✓ All packages are up to date!")
-            self.count_label.configure(text="All up to date")
-            self.status_bar.set_status("All packages are up to date")
-            self.upgrade_all_button.configure(state="disabled")
-
-        self.output_console.append(output)
-
-        # Log info about excluded pinned packages
-        if pinned_packages:
-            pinned_names = ", ".join(p.name for p in pinned_packages)
-            self.output_console.append(
-                f"\n⚠️ Excluded {len(pinned_packages)} pinned package(s) that require manual upgrade: {pinned_names}"
-            )
-
-        self.output_console.append("\n" + "=" * 50 + "\n")
-
-    def upgrade_single(self, package: Package):
-        """Upgrade a single package."""
-        card = self.package_list.get_card(package.id)
-        if card:
-            card.set_upgrading(True)
-
-        self.status_bar.set_status(f"Upgrading {package.name}...")
-        self.output_console.append(f"\n{'=' * 50}")
-        self.output_console.append(f"Upgrading: {package.name}")
-        self.output_console.append(f"{'=' * 50}\n")
-
-        def on_output(line: str):
-            self.after(
-                0, lambda line_text=line: self._handle_output_line(line_text, card)
-            )
-
-        def on_complete(success: bool, message: str):
-            def update_ui():
-                if card:
-                    card.set_complete(success)
-                self.output_console.append(f"\n{message}")
-                self.status_bar.set_status(message)
-
-                # Remove from packages list if successful
-                if success:
-                    self.packages = [p for p in self.packages if p.id != package.id]
-                    self.count_label.configure(
-                        text=f"{len(self.packages)} updates available"
-                        if self.packages
-                        else "All up to date"
-                    )
-
-            self.after(0, update_ui)
-
-        upgrade_package(package.id, on_output, on_complete, pinned=package.pinned)
-
-    def _handle_output_line(self, line: str, card):
-        """Parse output line and update progress if applicable."""
-        self.output_console.append(line)
-
-        if card and card.is_upgrading:
-            # Parse progress from winget output
-            # Example: "  ██████████████████████████████  4.54 MB / 4.54 MB"
-            import re
-
-            # Download progress pattern
-            progress_match = re.search(
-                r"([\d.]+)\s*(KB|MB|GB)\s*/\s*([\d.]+)\s*(KB|MB|GB)", line
-            )
-            if progress_match:
-                current = float(progress_match.group(1))
-                current_unit = progress_match.group(2)
-                total = float(progress_match.group(3))
-                total_unit = progress_match.group(4)
-
-                # Convert to same unit for comparison
-                unit_multipliers = {"KB": 1, "MB": 1024, "GB": 1024 * 1024}
-                current_kb = current * unit_multipliers.get(current_unit, 1)
-                total_kb = total * unit_multipliers.get(total_unit, 1)
-
-                if total_kb > 0:
-                    progress = min(current_kb / total_kb, 1.0)
-                    status = f"Downloading: {progress_match.group(1)} {current_unit} / {progress_match.group(3)} {total_unit}"
-                    self.after(
-                        0, lambda p=progress, s=status: card.update_progress(p, s)
-                    )
-
-            # Check for install phase
-            elif "Starting package install" in line or "Installing" in line:
-                self.after(0, lambda: card.update_progress(0.5, "Installing..."))
-            elif "verif" in line.lower():
-                self.after(0, lambda: card.update_progress(0.3, "Verifying hash..."))
-            elif "Successfully installed" in line:
-                self.after(0, lambda: card.update_progress(1.0, "Complete!"))
-
-    def upgrade_all(self):
-        """Upgrade all packages."""
-        if not self.packages or self.is_upgrading_all:
+        if result.error:
+            self.packages = []
+            self.package_list.show_message(f"⚠️ {result.error}", kind="error")
+            self.count_label.configure(text="")
+            self.status_bar.set_status("Scan failed")
+            self.upgrade_button.configure(state="disabled")
+            self.output_console.append(f"\n⚠️ {result.error}\n")
             return
 
-        self.is_upgrading_all = True
-        self.upgrade_all_button.configure(state="disabled", text="Upgrading...")
-        self.refresh_button.configure(state="disabled")
-        self.progress_bar.grid()
-        self.progress_bar.set(0)
+        # Pinned packages are shown but deselected by default: winget can
+        # upgrade them with --include-pinned, but the pin usually exists
+        # for a reason (self-updating apps, held versions).
+        self.packages = sorted(result.packages, key=lambda p: p.name.lower())
+        skipped = set(self.config_data.get("skipped_ids", []))
+        selected_ids = {
+            p.id for p in self.packages if p.id not in skipped and not p.pinned
+        }
 
-        packages_to_upgrade = self.packages.copy()
+        if self.packages:
+            self.package_list.set_packages(self.packages, selected_ids=selected_ids)
+            self.status_bar.set_status(
+                f"Found {len(self.packages)} package(s) with updates"
+            )
+            pinned_count = sum(p.pinned for p in self.packages)
+            if pinned_count:
+                self.output_console.append(
+                    f"\n📌 {pinned_count} pinned package(s) require explicit targeting — "
+                    "deselected by default."
+                )
+        else:
+            self.package_list.show_message(
+                "✓ All packages are up to date!", kind="success"
+            )
+            self.status_bar.set_status("All packages are up to date")
+
+        self.select_all_var.set(len(selected_ids) == len(self.packages))
+        self._update_selection_ui()
+        self.output_console.append("=" * 50 + "\n")
+
+    # ------------------------------------------------------------ upgrades
+
+    def upgrade_single(self, package: Package):
+        self._start_upgrades([package])
+
+    def upgrade_selected(self):
+        selection = self.package_list.selected_packages()
+        if selection:
+            self._start_upgrades(selection)
+
+    def _start_upgrades(self, targets: list[Package]):
+        if self.busy is not None:
+            return
+
+        self._set_busy("upgrade")
+        self.cancel_event.clear()
+        self.upgrade_button.configure(text="Upgrading…")
         self.current_upgrade_card = None
+        batch = len(targets) > 1
+        if batch:
+            self.cancel_button.grid()
+            self.progress_bar.grid()
+            self.progress_bar.set(0)
 
         def on_output(line: str):
-            self.after(
-                0,
-                lambda line_text=line: self._handle_output_line(
-                    line_text, self.current_upgrade_card
-                ),
-            )
+            self.after(0, lambda text=line: self._handle_output_line(text))
 
-        def on_progress(current: int, total: int, name: str):
+        def on_progress(current: int, total: int, pkg: Package):
             def update_ui():
-                progress = current / total
-                self.progress_bar.set(progress)
-                self.status_bar.set_status(f"Upgrading {name}...")
-                self.status_bar.set_progress(f"{current}/{total}")
-
-                # Update the card
-                for pkg in packages_to_upgrade:
-                    if pkg.name == name:
-                        card = self.package_list.get_card(pkg.id)
-                        if card:
-                            card.set_upgrading(True)
-                            self.current_upgrade_card = card
-                        break
+                self.status_bar.set_status(f"Upgrading {pkg.name}…")
+                if batch:
+                    self.status_bar.set_progress(f"{current}/{total}")
+                card = self.package_list.get_card(pkg.id)
+                if card:
+                    card.set_upgrading(True)
+                    self.current_upgrade_card = card
+                    self._download_active = False
 
             self.after(0, update_ui)
 
-        def on_complete(success_count: int, fail_count: int):
+        def on_package_complete(pkg: Package, result: UpgradeResult):
             def update_ui():
-                self.is_upgrading_all = False
-                self.current_upgrade_card = None
-                self.progress_bar.grid_remove()
-                self.refresh_button.configure(state="normal")
-
-                # Update all cards
-                for pkg in packages_to_upgrade:
-                    card = self.package_list.get_card(pkg.id)
-                    if card and card.is_upgrading:
-                        card.set_complete(True)
-
-                message = f"Complete: {success_count} succeeded, {fail_count} failed"
-                self.status_bar.set_status(message)
-                self.status_bar.set_progress("")
-                self.output_console.append(f"\n{'=' * 50}")
-                self.output_console.append(message)
-                self.output_console.append(f"{'=' * 50}\n")
-
-                if fail_count == 0:
-                    self.upgrade_all_button.configure(
-                        text="✓ All Done", fg_color=("#2ECC71", "#27AE60")
-                    )
-                    self.packages = []
-                    self.count_label.configure(text="All up to date")
+                card = self.package_list.get_card(pkg.id)
+                if card:
+                    card.set_result(result)
+                if self.current_upgrade_card is card:
+                    self.current_upgrade_card = None
+                if batch:
+                    done = self.progress_bar.get() + 1 / len(targets)
+                    self.progress_bar.set(min(done, 1.0))
+                if result.success:
+                    self.packages = [p for p in self.packages if p.id != pkg.id]
+                    icon = "🔁" if result.reboot_required else "✓"
                 else:
-                    self.upgrade_all_button.configure(
-                        text="⬆️ Retry Failed",
-                        state="normal",
-                        fg_color=("#E74C3C", "#C0392B"),
-                    )
-                    # Refresh to get remaining packages
-                    self.after(1000, self.refresh_packages)
+                    icon = "✗"
+                self.output_console.append(f"\n{icon} {pkg.name}: {result.reason}\n")
 
             self.after(0, update_ui)
 
-        upgrade_all_packages(packages_to_upgrade, on_output, on_progress, on_complete)
+        def on_complete(success_count: int, fail_count: int, cancelled: bool):
+            def update_ui():
+                self.cancel_button.grid_remove()
+                self.cancel_button.configure(state="normal", text="✕ Cancel")
+                self.progress_bar.grid_remove()
+                self.status_bar.set_progress("")
+                self._clear_busy()
+
+                parts = [f"{success_count} succeeded"]
+                if fail_count:
+                    parts.append(f"{fail_count} failed")
+                if cancelled:
+                    parts.append("cancelled before finishing")
+                message = "Done: " + ", ".join(parts)
+                self.status_bar.set_status(message)
+                self.output_console.append("=" * 50)
+                self.output_console.append(message)
+                self.output_console.append("=" * 50 + "\n")
+                if fail_count:
+                    self.status_bar.set_status(
+                        message + " — failure reasons are shown on each package"
+                    )
+
+            self.after(0, update_ui)
+
+        upgrade_packages(
+            targets,
+            output_callback=on_output,
+            progress_callback=on_progress,
+            package_complete_callback=on_package_complete,
+            complete_callback=on_complete,
+            cancel_event=self.cancel_event,
+        )
+
+    def _on_cancel(self):
+        self.cancel_event.set()
+        self.cancel_button.configure(state="disabled", text="Finishing current…")
+        self.status_bar.set_status(
+            "Cancelling — the package currently upgrading will finish first"
+        )
+
+    def _handle_output_line(self, line: str):
+        """Append output and update the active card's progress display."""
+        self.output_console.append(line)
+
+        card = self.current_upgrade_card
+        if not card or not card.is_upgrading:
+            return
+        try:
+            # Only the download phase reports sizes; everything else is shown
+            # as an animated bar. No English keywords — winget output is
+            # localized to the Windows display language.
+            match = _PROGRESS_RE.search(line)
+            if match:
+                current_kb = _to_float(match.group(1)) * _UNIT_KB.get(match.group(2), 1)
+                total_kb = _to_float(match.group(3)) * _UNIT_KB.get(match.group(4), 1)
+                if total_kb > 0:
+                    progress = min(current_kb / total_kb, 1.0)
+                    status = (
+                        f"Downloading: {match.group(1)} {match.group(2)}"
+                        f" / {match.group(3)} {match.group(4)}"
+                    )
+                    card.update_progress(progress, status)
+                    self._download_active = True
+            elif self._download_active:
+                self._download_active = False
+                card.set_indeterminate("Installing…")
+        except Exception:
+            # A destroyed widget or malformed line must never kill the UI loop.
+            logger.exception("Progress update failed")
+
+    # ------------------------------------------------------------- events
+
+    def _on_package_toggle(self, package: Package, selected: bool):
+        skipped = set(self.config_data.get("skipped_ids", []))
+        if selected:
+            skipped.discard(package.id)
+        else:
+            skipped.add(package.id)
+        self.config_data["skipped_ids"] = sorted(skipped)
+        config.save_config(self.config_data)
+        # Sync the header checkbox; programmatic set() does not re-fire handlers.
+        pending = [
+            c
+            for c in self.package_list.package_cards.values()
+            if c.result_state != "success"
+        ]
+        self.select_all_var.set(bool(pending) and all(c.selected for c in pending))
+        self._update_selection_ui()
+
+    def _on_select_all(self):
+        self.package_list.set_all_selected(self.select_all_var.get())
+        # set_all_selected() bypasses per-card handlers, so persist the skip
+        # list here — only for packages currently shown, preserving the rest.
+        skipped = set(self.config_data.get("skipped_ids", []))
+        for pkg_id, card in self.package_list.package_cards.items():
+            if card.result_state == "success":
+                continue
+            if card.selected:
+                skipped.discard(pkg_id)
+            else:
+                skipped.add(pkg_id)
+        self.config_data["skipped_ids"] = sorted(skipped)
+        config.save_config(self.config_data)
+        self._update_selection_ui()
+
+    def _on_appearance_change(self, value: str):
+        ctk.set_appearance_mode(value.lower())
+        self.config_data["appearance"] = value.lower()
+        config.save_config(self.config_data)
+
+    def _on_close(self):
+        if self.busy == "upgrade":
+            if not messagebox.askyesno(
+                "Upgrade in progress",
+                "An upgrade is still running. Quitting now may leave it "
+                "half-finished.\n\nQuit anyway?",
+            ):
+                return
+            self.cancel_event.set()
+        self.destroy()
 
 
 def main():
+    config.setup_logging()
+    logger.info("Starting Winget Upgrade Manager v%s", __version__)
     app = WingetUpgradeApp()
     app.mainloop()
 

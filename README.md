@@ -1,11 +1,12 @@
 # 📦 Winget Upgrade Manager
 
-A modern, dark-themed desktop GUI for managing Windows package upgrades via winget.
+A modern desktop GUI for managing Windows package upgrades via winget — with dark and light themes.
 
 ![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)
-![CustomTkinter](https://img.shields.io/badge/CustomTkinter-5.2+-green.svg)
+![CustomTkinter](https://img.shields.io/badge/CustomTkinter-6.0-green.svg)
 ![Windows](https://img.shields.io/badge/Windows-10%2F11-blue.svg)
 ![License](https://img.shields.io/badge/License-MIT-yellow.svg)
+[![CI](https://github.com/Dsgj/winget-upgrade-gui/actions/workflows/ci.yml/badge.svg)](https://github.com/Dsgj/winget-upgrade-gui/actions/workflows/ci.yml)
 
 <p align="center">
   <strong>Stop using the command line for package updates!</strong><br>
@@ -16,13 +17,16 @@ A modern, dark-themed desktop GUI for managing Windows package upgrades via wing
 
 ## ✨ Features
 
-- 📋 **Package List View** — See all available updates in a clean card-based layout
-- ⬆️ **One-Click Upgrades** — Upgrade individual packages or all at once
-- 📊 **Real-Time Progress** — Watch download and installation progress
-- 📜 **Live Console** — View command output in the integrated console
-- 🌙 **Dark Mode** — Modern dark theme that's easy on the eyes
-- 🔄 **Auto-Refresh** — Automatically scan for updates on launch
-- 📌 **Smart Filtering** — Automatically excludes pinned packages that can't be upgraded via winget
+- 📋 **Package List View** — All available updates in a clean card-based layout
+- ☑️ **Pick What You Upgrade** — Per-package checkboxes with *Upgrade Selected*, or upgrade one package with a click
+- 🧠 **Remembered Skips** — Packages you deselect stay deselected on future scans
+- 💬 **Clear Failure Reasons** — When an upgrade fails you see *why* (app running, needs admin, disk full, pinned, …) mapped from winget's documented return codes, right on the package card
+- 📊 **Real-Time Progress** — Download and installation progress per package and overall
+- 🛑 **Safe Cancel** — Stop a batch upgrade; the package in flight finishes cleanly first
+- 📜 **Live Console** — Full winget output in the integrated console
+- 🌍 **Locale-Independent** — Parses winget output structurally, so it works on non-English Windows too
+- 🌙 **Dark / Light / System Theme** — Switch anytime; your choice is remembered
+- 📌 **Pinned Package Awareness** — Pinned packages are shown (deselected by default) instead of silently hidden
 
 ---
 
@@ -30,7 +34,7 @@ A modern, dark-themed desktop GUI for managing Windows package upgrades via wing
 
 ### Option 1: Download Executable (Recommended)
 
-1. Go to [Releases](../../releases)
+1. Go to [Releases](https://github.com/Dsgj/winget-upgrade-gui/releases)
 2. Download the latest `WingetUpgradeManager.exe`
 3. Run it — no installation needed!
 
@@ -44,7 +48,7 @@ A modern, dark-themed desktop GUI for managing Windows package upgrades via wing
 
 ```powershell
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/winget-upgrade-gui.git
+git clone https://github.com/Dsgj/winget-upgrade-gui.git
 cd winget-upgrade-gui
 
 # Install dependencies
@@ -58,31 +62,16 @@ python main.py
 
 ## 🔨 Building from Source
 
-Want to create your own executable? It's easy!
-
-### Quick Build
-
 ```powershell
 # Install build dependencies
 pip install -r requirements-dev.txt
 
-# Run the build script
+# Run the build script (embeds the icon and version metadata)
 python build.py
 ```
 
-The executable will be created at `dist/WingetUpgradeManager.exe`.
-
-### Manual Build with PyInstaller
-
-```powershell
-pip install pyinstaller
-
-pyinstaller --onefile --windowed --name WingetUpgradeManager ^
-  --collect-all customtkinter ^
-  --hidden-import customtkinter ^
-  --hidden-import darkdetect ^
-  main.py
-```
+The executable will be created at `dist/WingetUpgradeManager.exe`. The release
+CI workflow runs this same script, so a local build matches a released one.
 
 > **Note:** The executable will be approximately 50-80 MB due to the bundled Python runtime and GUI libraries.
 
@@ -91,42 +80,41 @@ pyinstaller --onefile --windowed --name WingetUpgradeManager ^
 ## 🖥️ Usage
 
 1. **Launch** — The app automatically scans for available updates on startup
-2. **Refresh** — Click the 🔄 Refresh button to check for new updates
-3. **Upgrade Single** — Click the "Upgrade" button on any package card
-4. **Upgrade All** — Click the green "⬆️ Upgrade All" button to upgrade everything
+2. **Refresh** — Click 🔄 Refresh to check again
+3. **Select** — Tick the packages you want (deselections are remembered)
+4. **Upgrade** — Click ⬆️ *Upgrade Selected*, or the *Upgrade* button on a single card
+5. **If something fails** — The reason appears on the package card and in the output console
 
-The output console at the bottom shows real-time command output and any errors.
+Settings and logs live in `%LOCALAPPDATA%\WingetUpgradeManager\`
+(`config.json`, `app.log`).
 
 ---
 
 ## 📁 Project Structure
 
-```
+```text
 winget-upgrade-gui/
-├── main.py              # Application entry point
-├── winget_runner.py     # Winget command execution
+├── main.py              # Application window and orchestration
 ├── ui_components.py     # Custom UI components
-├── build.py             # Local build script
+├── winget_runner.py     # winget execution, parsing, return-code mapping
+├── config.py            # Persisted settings + logging
+├── version.py           # Single source of truth for the version
+├── build.py             # Build script (used locally and by CI)
+├── assets/icon.ico      # Application icon
+├── tests/               # Parser and return-code tests
 ├── requirements.txt     # Runtime dependencies
-├── requirements-dev.txt # Build dependencies
-├── .github/workflows/   # CI/CD automation
-├── SECURITY.md          # Security policy
-├── LICENSE              # MIT License
-├── CONTRIBUTING.md      # Contribution guidelines
-└── README.md            # This file
+├── requirements-dev.txt # Build/test dependencies
+└── .github/workflows/   # CI (lint/test/build) and release automation
 ```
 
 ---
 
 ## 🔐 Security
 
-This project is a **safe, open-source alternative** to bloatware package managers:
-
 - ✅ **100% Open Source** — All code is visible and auditable
 - ✅ **No Telemetry** — Zero data collection
-- ✅ **No Network Requests** — Only runs local `winget` commands
-- ✅ **Automated CI Builds** — Executables built on GitHub's infrastructure
-- ✅ **SHA256 Checksums** — GitHub auto-generates for all releases
+- ✅ **No Network Requests of Its Own** — The app only runs local `winget` commands; downloads are performed by winget
+- ✅ **CI-Built Releases** — Executables are built on GitHub's infrastructure by the [release workflow](.github/workflows/release.yml), with SHA256 checksums and [build provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations) published alongside
 
 See [SECURITY.md](SECURITY.md) for verification instructions.
 
@@ -135,6 +123,7 @@ See [SECURITY.md](SECURITY.md) for verification instructions.
 ## 🤝 Contributing
 
 Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Notable changes are tracked in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 

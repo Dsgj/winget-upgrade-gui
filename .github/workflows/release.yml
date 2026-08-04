@@ -21,7 +21,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
           cache: "pip"
 
       - name: Install dependencies
@@ -29,14 +29,24 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
 
-      - name: Build executable
+      - name: Check tag matches version.py
+        shell: pwsh
         run: |
-          pyinstaller --onefile --windowed --name WingetUpgradeManager `
-            --collect-all customtkinter `
-            --hidden-import customtkinter `
-            --hidden-import darkdetect `
-            --hidden-import PIL `
-            main.py
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          $version = python -c "from version import __version__; print(__version__)"
+          if ($tag -ne $version) {
+            Write-Error "Tag v$tag does not match version.py ($version). Bump version.py before tagging."
+            exit 1
+          }
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: python -m pytest -q
+
+      - name: Build executable
+        run: python build.py
 
       - name: Generate checksums
         shell: pwsh

@@ -15,6 +15,7 @@ dist/
 
 # PyInstaller
 *.spec
+file_version_info.txt
 
 # Virtual environments
 venv/

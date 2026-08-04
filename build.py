@@ -1,25 +1,69 @@
 #!/usr/bin/env python3
 """
 Build Script for Winget Upgrade Manager
-Creates a standalone Windows executable using PyInstaller.
+Creates a standalone Windows executable using PyInstaller, with the app
+icon and Windows version metadata embedded. CI calls this same script so
+local and release builds cannot drift.
 """
 
+import hashlib
+import shutil
 import subprocess
 import sys
-import shutil
 from pathlib import Path
 
+from version import __version__
 
-def main():
-    """Build the executable."""
+APP_NAME = "WingetUpgradeManager"
+
+VERSION_FILE_TEMPLATE = """\
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers={version_tuple},
+    prodvers={version_tuple},
+    mask=0x3F,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0),
+  ),
+  kids=[
+    StringFileInfo([StringTable('040904B0', [
+      StringStruct('CompanyName', 'winget-upgrade-gui contributors'),
+      StringStruct('FileDescription', 'Winget Upgrade Manager'),
+      StringStruct('FileVersion', '{version}'),
+      StringStruct('InternalName', '{app_name}'),
+      StringStruct('LegalCopyright', 'MIT License'),
+      StringStruct('OriginalFilename', '{app_name}.exe'),
+      StringStruct('ProductName', 'Winget Upgrade Manager'),
+      StringStruct('ProductVersion', '{version}'),
+    ])]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])]),
+  ],
+)
+"""
+
+
+def version_tuple() -> str:
+    parts = [int(p) for p in __version__.split(".")]
+    while len(parts) < 4:
+        parts.append(0)
+    return str(tuple(parts[:4]))
+
+
+def main() -> int:
+    # CI consoles (cp1252) choke on ✓/✗ otherwise; Actions renders UTF-8 fine.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     print("=" * 60)
-    print("Building Winget Upgrade Manager")
+    print(f"Building Winget Upgrade Manager v{__version__}")
     print("=" * 60)
 
-    # Ensure we're in the project directory
     project_dir = Path(__file__).parent
 
-    # Check for PyInstaller
     try:
         import PyInstaller
 
@@ -31,76 +75,91 @@ def main():
         )
         print("✓ PyInstaller installed")
 
-    # Clean previous builds
     for folder in ["build", "dist"]:
         path = project_dir / folder
         if path.exists():
             print(f"Cleaning {folder}/...")
-            shutil.rmtree(path)
+            try:
+                shutil.rmtree(path)
+            except PermissionError:
+                print(
+                    f"\n✗ Cannot remove {folder}/ — a file is locked. "
+                    "Close any running WingetUpgradeManager.exe (check Task "
+                    "Manager) and wait for OneDrive sync, then retry."
+                )
+                return 1
 
-    # Build command
+    version_file = project_dir / "file_version_info.txt"
+    version_file.write_text(
+        VERSION_FILE_TEMPLATE.format(
+            version=__version__,
+            version_tuple=version_tuple(),
+            app_name=APP_NAME,
+        ),
+        encoding="utf-8",
+    )
+
+    icon = project_dir / "assets" / "icon.ico"
+
     cmd = [
         sys.executable,
         "-m",
         "PyInstaller",
-        "--onefile",  # Single executable
-        "--windowed",  # No console window
+        "--onefile",
+        "--windowed",
         "--name",
-        "WingetUpgradeManager",
-        "--clean",  # Clean PyInstaller cache
-        # Hidden imports for CustomTkinter
+        APP_NAME,
+        "--clean",
+        "--icon",
+        str(icon),
+        "--add-data",
+        f"{icon};assets",
+        "--version-file",
+        str(version_file),
         "--hidden-import",
         "customtkinter",
         "--hidden-import",
         "darkdetect",
         "--hidden-import",
         "PIL",
-        # Collect all CustomTkinter data files
         "--collect-all",
         "customtkinter",
-        # Main script
         str(project_dir / "main.py"),
     ]
 
     print("\nRunning PyInstaller...")
     print("-" * 60)
-
-    result = subprocess.run(cmd, cwd=project_dir)
-
+    try:
+        result = subprocess.run(cmd, cwd=project_dir, check=False)
+    finally:
+        # Clean up generated intermediates even on Ctrl+C
+        for name in [f"{APP_NAME}.spec", "file_version_info.txt"]:
+            artifact = project_dir / name
+            if artifact.exists():
+                artifact.unlink()
     print("-" * 60)
 
-    if result.returncode == 0:
-        exe_path = project_dir / "dist" / "WingetUpgradeManager.exe"
-        if exe_path.exists():
-            size_mb = exe_path.stat().st_size / (1024 * 1024)
-            print("\n✓ Build successful!")
-            print(f"  Output: {exe_path}")
-            print(f"  Size: {size_mb:.1f} MB")
-        else:
-            print("\n✗ Build completed but executable not found")
-            return 1
-    else:
+    if result.returncode != 0:
         print(f"\n✗ Build failed with code {result.returncode}")
         return 1
 
-    # Clean up spec file (we don't need it in the repo)
-    spec_file = project_dir / "WingetUpgradeManager.spec"
-    if spec_file.exists():
-        spec_file.unlink()
-        print("  Cleaned up spec file")
+    exe_path = project_dir / "dist" / f"{APP_NAME}.exe"
+    if not exe_path.exists():
+        print("\n✗ Build completed but executable not found")
+        return 1
 
-    # Generate and display checksum (for verification)
-    import hashlib
-
+    size_mb = exe_path.stat().st_size / (1024 * 1024)
     sha256_hash = hashlib.sha256()
     with open(exe_path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
+        for chunk in iter(lambda: f.read(65536), b""):
             sha256_hash.update(chunk)
-    checksum = sha256_hash.hexdigest().upper()
-    print(f"  SHA256: {checksum}")
 
+    print("\n✓ Build successful!")
+    print(f"  Output: {exe_path}")
+    print(f"  Size:   {size_mb:.1f} MB")
+    print(f"  SHA256: {sha256_hash.hexdigest().upper()}")
     print("\n" + "=" * 60)
-    print("Done! You can now run dist/WingetUpgradeManager.exe")
+    print(f"Done! You can now run dist/{APP_NAME}.exe")
     print("=" * 60)
     return 0
 

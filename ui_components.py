@@ -1,25 +1,47 @@
 """
 Custom UI Components for Winget Upgrade GUI
-Built on CustomTkinter for a modern, dark-themed appearance.
+Built on CustomTkinter for a modern appearance in dark and light mode.
 """
 
+from __future__ import annotations
+
+from typing import Callable
+
 import customtkinter as ctk
-from typing import Callable, Optional
-from winget_runner import Package
+
+from winget_runner import Package, UpgradeResult
+
+SUCCESS_COLORS = ("#2ECC71", "#27AE60")
+SUCCESS_HOVER = ("#27AE60", "#1E8449")
+DANGER_COLORS = ("#E74C3C", "#C0392B")
+DANGER_HOVER = ("#C0392B", "#922B21")
+WARNING_TEXT = ("#B9770E", "#F39C12")
+DANGER_TEXT = ("#C0392B", "#E74C3C")
+MUTED_TEXT = ("gray40", "gray60")
 
 
 class PackageCard(ctk.CTkFrame):
-    """A card displaying a single package with upgrade button and progress bar."""
+    """A card for one package: checkbox, info, upgrade button, progress/result row."""
 
     def __init__(
-        self, parent, package: Package, on_upgrade: Callable[[Package], None], **kwargs
+        self,
+        parent,
+        package: Package,
+        on_upgrade: Callable[[Package], None],
+        on_toggle: Callable[[Package, bool], None] | None = None,
+        selected: bool = True,
+        **kwargs,
     ):
         super().__init__(parent, **kwargs)
         self.package = package
         self.on_upgrade = on_upgrade
+        self.on_toggle = on_toggle
         self.is_upgrading = False
+        # None while pending, then "success" or "failed". Succeeded cards are
+        # permanently deselected and disabled so they can't be re-upgraded.
+        self.result_state: str | None = None
+        self._determinate = True  # the bar is created in determinate mode
 
-        # Configure the frame
         self.configure(
             corner_radius=8,
             fg_color=("gray90", "gray17"),
@@ -27,22 +49,27 @@ class PackageCard(ctk.CTkFrame):
             border_color=("gray70", "gray30"),
         )
 
-        # Grid configuration
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_columnconfigure(1, weight=0)
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=0)
+        self.grid_columnconfigure(1, weight=1)
 
-        # Left side - Package info
+        # Selection checkbox
+        self.selected_var = ctk.BooleanVar(value=selected)
+        self.checkbox = ctk.CTkCheckBox(
+            self,
+            text="",
+            width=24,
+            variable=self.selected_var,
+            command=self._on_toggle,
+        )
+        self.checkbox.grid(row=0, column=0, sticky="n", padx=(14, 0), pady=(16, 0))
+
+        # Package info
         info_frame = ctk.CTkFrame(self, fg_color="transparent")
-        info_frame.grid(row=0, column=0, sticky="nsew", padx=15, pady=12)
+        info_frame.grid(row=0, column=1, sticky="nsew", padx=(4, 15), pady=12)
         info_frame.grid_columnconfigure(0, weight=1)
 
-        # Package name (truncate if too long) with pinned indicator
         display_name = (
-            package.name[:50] + "..." if len(package.name) > 50 else package.name
+            package.name[:60] + "…" if len(package.name) > 60 else package.name
         )
-        # Add pinned indicator for packages requiring explicit targeting
         if package.pinned:
             display_name = f"📌 {display_name}"
         self.name_label = ctk.CTkLabel(
@@ -53,18 +80,16 @@ class PackageCard(ctk.CTkFrame):
         )
         self.name_label.grid(row=0, column=0, sticky="w")
 
-        # Package ID
         self.id_label = ctk.CTkLabel(
             info_frame,
             text=package.id,
             font=ctk.CTkFont(size=11),
-            text_color=("gray40", "gray60"),
+            text_color=MUTED_TEXT,
             anchor="w",
         )
         self.id_label.grid(row=1, column=0, sticky="w", pady=(2, 0))
 
-        # Version info
-        version_text = f"{package.current_version}  →  {package.available_version}"
+        version_text = f"{package.current_version or '?'}  →  {package.available_version}"
         self.version_label = ctk.CTkLabel(
             info_frame,
             text=version_text,
@@ -74,9 +99,9 @@ class PackageCard(ctk.CTkFrame):
         )
         self.version_label.grid(row=2, column=0, sticky="w", pady=(4, 0))
 
-        # Right side - Upgrade button
+        # Upgrade button + source
         button_frame = ctk.CTkFrame(self, fg_color="transparent")
-        button_frame.grid(row=0, column=1, sticky="nse", padx=15, pady=12)
+        button_frame.grid(row=0, column=2, sticky="nse", padx=15, pady=12)
 
         self.upgrade_button = ctk.CTkButton(
             button_frame,
@@ -88,7 +113,6 @@ class PackageCard(ctk.CTkFrame):
         )
         self.upgrade_button.pack(anchor="center", expand=True)
 
-        # Source label
         self.source_label = ctk.CTkLabel(
             button_frame,
             text=package.source,
@@ -97,15 +121,14 @@ class PackageCard(ctk.CTkFrame):
         )
         self.source_label.pack(anchor="center", pady=(4, 0))
 
-        # Progress section (hidden by default)
+        # Progress / result row (hidden until needed)
         self.progress_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.progress_frame.grid(
-            row=1, column=0, columnspan=2, sticky="ew", padx=15, pady=(0, 10)
+            row=1, column=0, columnspan=3, sticky="ew", padx=15, pady=(0, 10)
         )
         self.progress_frame.grid_columnconfigure(0, weight=1)
-        self.progress_frame.grid_remove()  # Hidden initially
+        self.progress_frame.grid_remove()
 
-        # Progress bar
         self.progress_bar = ctk.CTkProgressBar(
             self.progress_frame,
             height=8,
@@ -115,108 +138,207 @@ class PackageCard(ctk.CTkFrame):
         self.progress_bar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
         self.progress_bar.set(0)
 
-        # Progress status label
         self.progress_label = ctk.CTkLabel(
             self.progress_frame,
             text="",
             font=ctk.CTkFont(size=11),
-            text_color=("gray40", "gray60"),
+            text_color=MUTED_TEXT,
             anchor="w",
+            justify="left",
         )
         self.progress_label.grid(row=1, column=0, sticky="w")
 
-    def _on_upgrade_click(self):
+    # -- selection ---------------------------------------------------------
+
+    @property
+    def selected(self) -> bool:
+        return bool(self.selected_var.get())
+
+    def set_selected(self, selected: bool) -> None:
+        self.selected_var.set(selected)
+
+    def _on_toggle(self) -> None:
+        if self.on_toggle:
+            self.on_toggle(self.package, self.selected)
+
+    # -- actions -----------------------------------------------------------
+
+    def _on_upgrade_click(self) -> None:
         if not self.is_upgrading:
             self.on_upgrade(self.package)
 
-    def set_upgrading(self, upgrading: bool):
-        """Update the UI to show upgrading state."""
+    def set_enabled(self, enabled: bool) -> None:
+        """Enable/disable interaction while a global operation runs."""
+        if self.result_state == "success":
+            return  # a finished card must never become re-upgradable
+        state = "normal" if enabled else "disabled"
+        self.checkbox.configure(state=state)
+        if not self.is_upgrading:
+            self.upgrade_button.configure(state=state)
+
+    def set_upgrading(self, upgrading: bool) -> None:
         self.is_upgrading = upgrading
         if upgrading:
+            self.result_state = None
             self.upgrade_button.configure(
-                text="Upgrading...", state="disabled", fg_color=("gray60", "gray40")
+                text="Upgrading…", state="disabled", fg_color=("gray60", "gray40")
             )
-            self.progress_frame.grid()  # Show progress section
-            self.progress_bar.set(0)
-            self.progress_label.configure(text="Starting...")
+            self.checkbox.configure(state="disabled")
+            self.progress_frame.grid()
+            self.progress_bar.grid()
+            self.set_indeterminate("Working…")
         else:
             self.upgrade_button.configure(
                 text="Upgrade",
                 state="normal",
                 fg_color=ctk.ThemeManager.theme["CTkButton"]["fg_color"],
             )
-            self.progress_frame.grid_remove()  # Hide progress section
+            self.checkbox.configure(state="normal")
+            self._stop_bar()
+            self.progress_frame.grid_remove()
 
-    def update_progress(self, progress: float, status: str):
-        """Update the progress bar and status text."""
-        self.progress_bar.set(progress)
-        self.progress_label.configure(text=status)
+    def _stop_bar(self) -> None:
+        if not self._determinate:
+            self.progress_bar.stop()
+            self.progress_bar.configure(mode="determinate")
+            self._determinate = True
 
-        # Change color based on stage
-        if "download" in status.lower():
-            self.progress_bar.configure(progress_color=("#3B8ED0", "#1F6AA5"))
-        elif "install" in status.lower():
-            self.progress_bar.configure(progress_color=("#9B59B6", "#8E44AD"))
-        elif "verify" in status.lower():
-            self.progress_bar.configure(progress_color=("#F39C12", "#D68910"))
+    def set_indeterminate(self, status: str) -> None:
+        """Animate the bar when winget gives no percentage to show."""
+        if self._determinate:
+            self.progress_bar.configure(mode="indeterminate")
+            self.progress_bar.start()
+            self._determinate = False
+        self.progress_label.configure(text=status, text_color=MUTED_TEXT)
 
-    def set_complete(self, success: bool):
-        """Update the UI to show completion state."""
-        self.is_upgrading = False
-        self.progress_frame.grid_remove()  # Hide progress section
-
-        if success:
-            self.upgrade_button.configure(
-                text="✓ Done", state="disabled", fg_color=("#2ECC71", "#27AE60")
-            )
+    def update_progress(self, progress: float, status: str) -> None:
+        if not self._determinate:
+            self._stop_bar()
         else:
+            progress = max(progress, self.progress_bar.get())  # never move backwards
+        self.progress_bar.set(min(progress, 1.0))
+        self.progress_label.configure(text=status, text_color=MUTED_TEXT)
+
+    def set_result(self, result: UpgradeResult) -> None:
+        """Show the outcome of an upgrade, including the failure reason."""
+        self.is_upgrading = False
+        self._stop_bar()
+        self.progress_bar.grid_remove()
+
+        if result.success:
+            self.result_state = "success"
+            # Programmatic set() does not fire the checkbox command, so this
+            # does not touch the persisted skip list.
+            self.selected_var.set(False)
+            self.checkbox.configure(state="disabled")
             self.upgrade_button.configure(
-                text="✗ Failed", state="normal", fg_color=("#E74C3C", "#C0392B")
+                text="✓ Done", state="disabled", fg_color=SUCCESS_COLORS
+            )
+            if result.reboot_required:
+                self.progress_frame.grid()
+                self.progress_label.configure(
+                    text=f"🔁 {result.reason}", text_color=WARNING_TEXT
+                )
+            else:
+                self.progress_frame.grid_remove()
+        else:
+            self.result_state = "failed"
+            # Stays disabled until the batch ends; set_enabled re-enables it.
+            self.checkbox.configure(state="disabled")
+            self.upgrade_button.configure(
+                text="↻ Retry",
+                state="disabled",
+                fg_color=DANGER_COLORS,
+                hover_color=DANGER_HOVER,
+            )
+            self.progress_frame.grid()
+            self.progress_label.configure(
+                text=f"✗ {result.reason}",
+                text_color=DANGER_TEXT,
+                wraplength=600,
             )
 
 
 class PackageListFrame(ctk.CTkScrollableFrame):
-    """Scrollable frame containing package cards."""
+    """Scrollable frame containing package cards, plus loading/empty/error states."""
 
-    def __init__(self, parent, on_upgrade: Callable[[Package], None], **kwargs):
+    def __init__(
+        self,
+        parent,
+        on_upgrade: Callable[[Package], None],
+        on_toggle: Callable[[Package, bool], None] | None = None,
+        **kwargs,
+    ):
         super().__init__(parent, **kwargs)
         self.on_upgrade = on_upgrade
+        self.on_toggle = on_toggle
         self.package_cards: dict[str, PackageCard] = {}
+        self._message_label: ctk.CTkLabel | None = None
 
         self.configure(corner_radius=0, fg_color="transparent")
-
         self.grid_columnconfigure(0, weight=1)
 
-    def set_packages(self, packages: list[Package]):
-        """Clear and repopulate the package list."""
-        # Clear existing cards
+    def _clear(self) -> None:
         for card in self.package_cards.values():
             card.destroy()
         self.package_cards.clear()
+        if self._message_label is not None:
+            self._message_label.destroy()
+            self._message_label = None
 
-        # Create new cards
+    def set_packages(
+        self, packages: list[Package], selected_ids: set[str] | None = None
+    ) -> None:
+        """Clear and repopulate the package list."""
+        self._clear()
         for i, package in enumerate(packages):
-            card = PackageCard(self, package=package, on_upgrade=self.on_upgrade)
+            selected = True if selected_ids is None else package.id in selected_ids
+            card = PackageCard(
+                self,
+                package=package,
+                on_upgrade=self.on_upgrade,
+                on_toggle=self.on_toggle,
+                selected=selected,
+            )
             card.grid(row=i, column=0, sticky="ew", pady=(0, 8), padx=4)
             self.package_cards[package.id] = card
 
-    def get_card(self, package_id: str) -> Optional[PackageCard]:
-        """Get a package card by ID."""
+    def get_card(self, package_id: str) -> PackageCard | None:
         return self.package_cards.get(package_id)
 
-    def show_empty_message(self, message: str = "No packages available for upgrade"):
-        """Show a message when no packages are available."""
-        for card in self.package_cards.values():
-            card.destroy()
-        self.package_cards.clear()
-
-        label = ctk.CTkLabel(
+    def show_message(self, message: str, kind: str = "info") -> None:
+        """Replace the list with a status message (loading/empty/error)."""
+        self._clear()
+        colors = {
+            "info": MUTED_TEXT,
+            "success": ("#1E8449", "#2ECC71"),
+            "error": DANGER_TEXT,
+        }
+        self._message_label = ctk.CTkLabel(
             self,
             text=message,
-            font=ctk.CTkFont(size=14),
-            text_color=("gray40", "gray60"),
+            font=ctk.CTkFont(size=15),
+            text_color=colors.get(kind, MUTED_TEXT),
+            wraplength=640,
+            justify="center",
         )
-        label.grid(row=0, column=0, pady=40)
+        self._message_label.grid(row=0, column=0, pady=48)
+
+    def set_all_enabled(self, enabled: bool) -> None:
+        for card in self.package_cards.values():
+            card.set_enabled(enabled)
+
+    def set_all_selected(self, selected: bool) -> None:
+        for card in self.package_cards.values():
+            if card.result_state != "success":
+                card.set_selected(selected)
+
+    def selected_packages(self) -> list[Package]:
+        return [
+            card.package
+            for card in self.package_cards.values()
+            if card.selected and card.result_state != "success"
+        ]
 
 
 class OutputConsole(ctk.CTkFrame):
@@ -230,7 +352,6 @@ class OutputConsole(ctk.CTkFrame):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
 
-        # Header with title and clear button
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 4))
         header.grid_columnconfigure(0, weight=1)
@@ -251,11 +372,11 @@ class OutputConsole(ctk.CTkFrame):
             font=ctk.CTkFont(size=11),
             fg_color="transparent",
             border_width=1,
+            text_color=("gray20", "gray80"),
             command=self.clear,
         )
         clear_btn.grid(row=0, column=1, sticky="e")
 
-        # Text display
         self.textbox = ctk.CTkTextbox(
             self,
             font=ctk.CTkFont(family="Consolas", size=11),
@@ -266,28 +387,25 @@ class OutputConsole(ctk.CTkFrame):
         self.textbox.grid(row=1, column=0, sticky="nsew", padx=10, pady=(4, 10))
         self.textbox.configure(state="disabled")
 
-    def append(self, text: str):
-        """Append text to the console."""
+    def append(self, text: str) -> None:
         self.textbox.configure(state="normal")
         self.textbox.insert("end", text + "\n")
         self.textbox.see("end")
         self.textbox.configure(state="disabled")
 
-    def clear(self):
-        """Clear the console."""
+    def clear(self) -> None:
         self.textbox.configure(state="normal")
         self.textbox.delete("1.0", "end")
         self.textbox.configure(state="disabled")
 
 
 class StatusBar(ctk.CTkFrame):
-    """Status bar showing current operation status."""
+    """Status bar: operation status left, progress + session info right."""
 
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
 
         self.configure(height=30, corner_radius=0, fg_color=("gray85", "gray20"))
-
         self.grid_columnconfigure(0, weight=1)
 
         self.status_label = ctk.CTkLabel(
@@ -298,12 +416,22 @@ class StatusBar(ctk.CTkFrame):
         self.progress_label = ctk.CTkLabel(
             self, text="", font=ctk.CTkFont(size=11), anchor="e"
         )
-        self.progress_label.grid(row=0, column=1, sticky="e", padx=12, pady=4)
+        self.progress_label.grid(row=0, column=1, sticky="e", padx=(0, 8), pady=4)
 
-    def set_status(self, text: str):
-        """Set the status text."""
+        self.meta_label = ctk.CTkLabel(
+            self,
+            text="",
+            font=ctk.CTkFont(size=11),
+            anchor="e",
+            text_color=MUTED_TEXT,
+        )
+        self.meta_label.grid(row=0, column=2, sticky="e", padx=(0, 12), pady=4)
+
+    def set_status(self, text: str) -> None:
         self.status_label.configure(text=text)
 
-    def set_progress(self, text: str):
-        """Set the progress text."""
+    def set_progress(self, text: str) -> None:
         self.progress_label.configure(text=text)
+
+    def set_meta(self, text: str) -> None:
+        self.meta_label.configure(text=text)
