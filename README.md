@@ -13,6 +13,8 @@ A modern desktop GUI for managing Windows package upgrades via winget — with d
   A beautiful, intuitive interface for Windows Package Manager (winget).
 </p>
 
+![Winget Upgrade Manager](assets/screenshot.png)
+
 ---
 
 ## ✨ Features
