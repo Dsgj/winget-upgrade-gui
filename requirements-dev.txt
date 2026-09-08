@@ -2,4 +2,4 @@
 # that must pass CI before merging.
 pyinstaller==6.21.0
 pytest==9.1.1
-ruff==0.16.1
+ruff==0.16.6
